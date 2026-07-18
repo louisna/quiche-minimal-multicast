@@ -293,6 +293,7 @@ impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
             // LegacyRecovery never gets a RecoveryConfig with the
             // Bbr2Gcongestion algorithm.
             CongestionControlAlgorithm::Bbr2Gcongestion => unreachable!(),
+            CongestionControlAlgorithm::Disabled => &disabled::DISABLED,
         }
     }
 }
@@ -356,6 +357,7 @@ mod hystart;
 mod prr;
 pub(crate) mod recovery;
 mod reno;
+mod disabled;
 
 #[cfg(test)]
 mod test_sender;

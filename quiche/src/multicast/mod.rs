@@ -2,6 +2,7 @@
 
 use std::net;
 
+use crate::crypto;
 use crate::frame;
 use crate::multicast::error::McError;
 use crate::packet;
@@ -9,6 +10,18 @@ use crate::BufFactory;
 use crate::Connection;
 use crate::Error;
 use crate::Result;
+
+/// Maps a TLS cipher suite code point onto its AEAD [`crypto::Algorithm`].
+pub(crate) fn _alg_from_cipher_suite(
+    cipher_suite: u16,
+) -> Result<crypto::Algorithm> {
+    match cipher_suite {
+        0x1301 => Ok(crypto::Algorithm::AES128_GCM),
+        0x1302 => Ok(crypto::Algorithm::AES256_GCM),
+        0x1303 => Ok(crypto::Algorithm::ChaCha20_Poly1305),
+        _ => Err(Error::Multicast(McError::McFlow)),
+    }
+}
 
 /// Minimal multicast structure.
 /// The objective of this structure is to handle as much multicast-related task
@@ -27,6 +40,15 @@ pub struct MulticastData {
     /// Server: whether the `MC_FLOW` frame has been acknowledged by the client.
     /// Once acknowledged, the frame is no longer retransmitted.
     mc_flow_acked: bool,
+
+    /// Client: the flow key context, derived from the flow secret and cipher
+    /// suite, used to decrypt packets received on the flow.
+    flow_open: Option<crypto::Open>,
+
+    /// Client: the largest packet number successfully decrypted on the flow.
+    /// It is the basis for packet-number reconstruction; before any packet has
+    /// been decrypted, `First Packet Number` is used instead.
+    flow_largest_pn: Option<u64>,
 }
 
 impl MulticastData {
@@ -95,32 +117,39 @@ impl<F: BufFactory> Connection<F> {
         secret: Vec<u8>,
     ) -> Result<()> {
         if !self.is_server {
+            error!("MC provide flow 1");
             return Err(Error::Multicast(McError::McFlow));
         }
 
         // A server MUST NOT send MC_FLOW to a client that did not advertise
         // multicast support.
         if !self.peer_transport_params.multicast_support {
-            return Err(Error::Multicast(McError::McFlow));
+            error!("MC provide flow 2");
+            return Ok(());
         }
 
         if !(1..=packet::MAX_CID_LEN as usize).contains(&flow_id.len()) {
+            error!("MC provide flow 3");
             return Err(Error::Multicast(McError::McFlow));
         }
 
-        self.multicast = Some(MulticastData {
-            mc_flow_info: McFlowInfo {
-                flow_id,
-                source_ip,
-                group_ip,
-                udp_port,
-                cipher_suite,
-                first_pn,
-                secret,
-            },
-            mc_flow_sent: false,
-            mc_flow_acked: false,
-        });
+        if self.multicast.is_none() {
+            self.multicast = Some(MulticastData {
+                mc_flow_info: McFlowInfo {
+                    flow_id,
+                    source_ip,
+                    group_ip,
+                    udp_port,
+                    cipher_suite,
+                    first_pn,
+                    secret,
+                },
+                mc_flow_sent: false,
+                mc_flow_acked: false,
+                flow_open: None,
+                flow_largest_pn: Some(first_pn),
+            });
+        }
 
         Ok(())
     }
@@ -147,9 +176,27 @@ impl<F: BufFactory> Connection<F> {
             // Not meaningful on the client; the client never sends MC_FLOW.
             mc_flow_sent: true,
             mc_flow_acked: true,
+            flow_open: None, // TODO: derive from the secret.
+            flow_largest_pn: Some(first_pn),
         });
 
         Ok(())
+    }
+
+    /// Returns the flow traffic secret of a multicast sender connection, to be
+    /// advertised to clients via [`Connection::mc_provide_flow`].
+    pub fn mc_flow_secret(&self) -> Option<&[u8]> {
+        self.multicast
+            .as_ref()
+            .map(|mc| mc.mc_flow_info.secret.as_slice())
+    }
+
+    /// Returns the cipher suite of a multicast sender connection, to be
+    /// advertised to clients via [`Connection::mc_provide_flow`].
+    pub fn mc_flow_cipher_suite(&self) -> Option<u16> {
+        self.multicast
+            .as_ref()
+            .map(|mc| mc.mc_flow_info.cipher_suite)
     }
 
     /// Returns whether the server should schedule an `MC_FLOW` frame for
@@ -160,30 +207,31 @@ impl<F: BufFactory> Connection<F> {
     }
 }
 
+#[derive(Clone)]
 /// Handle information about a multicast flow.
-struct McFlowInfo {
+pub struct McFlowInfo {
     /// The Flow ID.
-    flow_id: Vec<u8>,
+    pub flow_id: Vec<u8>,
 
     /// The source IP address of the flow.
-    source_ip: net::IpAddr,
+    pub source_ip: net::IpAddr,
 
     /// The group IP address of the flow.
-    group_ip: net::IpAddr,
+    pub group_ip: net::IpAddr,
 
     /// The destination UDP port.
-    udp_port: u16,
+    pub udp_port: u16,
 
     /// The cipher suite used to decrypt packets from the multicast flow.
-    cipher_suite: u16,
+    pub cipher_suite: u16,
 
     /// The first packet number that we can expect to receive on the multicast
     /// flow.
-    first_pn: u64,
+    pub first_pn: u64,
 
     /// The TLS secret used to generate the decryption key for the multicast
     /// flow.
-    secret: Vec<u8>,
+    pub secret: Vec<u8>,
 }
 
 pub mod error;

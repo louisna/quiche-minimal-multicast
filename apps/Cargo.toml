@@ -35,6 +35,7 @@ octets = { workspace = true }
 quiche = { workspace = true }
 ring = { workspace = true }
 url = { workspace = true }
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [lib]
 crate-type = ["lib"]

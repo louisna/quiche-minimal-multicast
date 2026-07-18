@@ -360,7 +360,20 @@ impl Frame {
                         (source_ipv4.into(), group_ipv4.into())
                     },
                     6 => {
-                        todo!("Add support for multicast QUIC IPv6");
+                        let source_ipv6: [u8; 16] = b
+                            .get_bytes(16)?
+                            .buf()
+                            .try_into()
+                            .map_err(|_| Error::BufferTooShort)?;
+                        let group_ipv6: [u8; 16] = b
+                            .get_bytes(16)?
+                            .buf()
+                            .try_into()
+                            .map_err(|_| Error::BufferTooShort)?;
+                        (
+                            net::Ipv6Addr::from(source_ipv6).into(),
+                            net::Ipv6Addr::from(group_ipv6).into(),
+                        )
                     },
                     _ => return Err(Error::InvalidFrame),
                 };
@@ -659,16 +672,19 @@ impl Frame {
                 b.put_u8(flow_id.len() as u8)?;
                 b.put_bytes(flow_id.as_ref())?;
 
-                // Assumes that both addresses are of the same family.
+                // The source and group addresses must be of the same family.
                 match (source_ip, group_ip) {
                     (net::IpAddr::V4(src), net::IpAddr::V4(grp)) => {
                         b.put_u8(4)?;
                         b.put_u32(src.to_bits())?;
                         b.put_u32(grp.to_bits())?;
                     },
-                    _ => todo!(
-                        "Handle non-IPv4 addresses for minimal multicast QUIC"
-                    ),
+                    (net::IpAddr::V6(src), net::IpAddr::V6(grp)) => {
+                        b.put_u8(6)?;
+                        b.put_bytes(&src.octets())?;
+                        b.put_bytes(&grp.octets())?;
+                    },
+                    _ => return Err(Error::InvalidFrame),
                 }
 
                 b.put_u16(*udp_port)?;
@@ -905,6 +921,7 @@ impl Frame {
                 octets::varint_len(0xff4d43) + // frame type
                 1 + // flow_id length
                 flow_id.len() +
+                1 + // IP version
                 if source_ip.is_ipv4() { 4 + 4 } else { 16 + 16 } +
                 2 + // udp port
                 2 + // cipher suite

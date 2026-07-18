@@ -127,6 +127,7 @@ fn main() {
     config.set_disable_active_migration(true);
     config.enable_dgram(true, 1000, 1000);
     config.enable_early_data();
+    config.set_cc_algorithm_name("disabled").unwrap();
 
     let rng = SystemRandom::new();
     let conn_id_seed =

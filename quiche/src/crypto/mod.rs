@@ -271,6 +271,11 @@ impl Seal {
         self.alg
     }
 
+    /// Returns the traffic secret this key was derived from.
+    pub(crate) fn secret(&self) -> &[u8] {
+        &self.secret
+    }
+
     pub fn derive_next_packet_key(&self) -> Result<Seal> {
         let next_secret = derive_next_secret(self.alg, &self.secret)?;
 
