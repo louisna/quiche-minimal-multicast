@@ -80,11 +80,15 @@ impl<F: BufFactory> Connection<F> {
     /// Registers, on the server, a multicast flow to advertise to the client
     /// over its unicast connection.
     ///
-    /// The `MC_FLOW` frame describing the flow is scheduled for transmission and
-    /// retransmitted using normal QUIC loss recovery until acknowledged.
+    /// The `MC_FLOW` frame describing the flow is scheduled for transmission
+    /// and retransmitted using normal QUIC loss recovery until
+    /// acknowledged.
     ///
     /// The client MUST have advertised the `multicast_support` transport
     /// parameter; otherwise this returns [`McError::McFlow`].
+    // The arguments map one-to-one onto the fields of the MC_FLOW frame, so
+    // they are passed explicitly rather than bundled into a struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn mc_provide_flow(
         &mut self, flow_id: Vec<u8>, source_ip: net::IpAddr,
         group_ip: net::IpAddr, udp_port: u16, cipher_suite: u16, first_pn: u64,
@@ -122,6 +126,9 @@ impl<F: BufFactory> Connection<F> {
     }
 
     /// Creates state on the client for the advertised multicast flow.
+    // The arguments map one-to-one onto the fields of the MC_FLOW frame, so
+    // they are passed explicitly rather than bundled into a struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn mc_new_from_info(
         &mut self, flow_id: Vec<u8>, source_ip: net::IpAddr,
         group_ip: net::IpAddr, udp_port: u16, cipher_suite: u16, first_pn: u64,
@@ -149,9 +156,7 @@ impl<F: BufFactory> Connection<F> {
     /// transmission on the unicast connection.
     pub(crate) fn mc_should_send_flow(&self) -> bool {
         self.is_server &&
-            self.multicast
-                .as_ref()
-                .is_some_and(|mc| !mc.mc_flow_sent)
+            self.multicast.as_ref().is_some_and(|mc| !mc.mc_flow_sent)
     }
 }
 
