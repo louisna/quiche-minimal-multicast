@@ -9,10 +9,11 @@ use crate::packet;
 use crate::BufFactory;
 use crate::Connection;
 use crate::Error;
+use crate::RecvInfo;
 use crate::Result;
 
 /// Maps a TLS cipher suite code point onto its AEAD [`crypto::Algorithm`].
-pub(crate) fn _alg_from_cipher_suite(
+pub(crate) fn alg_from_cipher_suite(
     cipher_suite: u16,
 ) -> Result<crypto::Algorithm> {
     match cipher_suite {
@@ -163,6 +164,12 @@ impl<F: BufFactory> Connection<F> {
         group_ip: net::IpAddr, udp_port: u16, cipher_suite: u16, first_pn: u64,
         secret: Vec<u8>,
     ) -> Result<()> {
+        // Derive the flow key context from the secret, exactly as a 1-RTT
+        // application traffic secret (RFC 9001).
+        let alg = alg_from_cipher_suite(cipher_suite)?;
+        let flow_open = crypto::Open::from_secret(alg, &secret)
+            .map_err(|_| Error::Multicast(McError::McFlow))?;
+
         self.multicast = Some(MulticastData {
             mc_flow_info: McFlowInfo {
                 flow_id,
@@ -176,11 +183,102 @@ impl<F: BufFactory> Connection<F> {
             // Not meaningful on the client; the client never sends MC_FLOW.
             mc_flow_sent: true,
             mc_flow_acked: true,
-            flow_open: None, // TODO: derive from the secret.
+            flow_open: Some(flow_open),
             flow_largest_pn: Some(first_pn),
         });
 
         Ok(())
+    }
+
+    /// Processes a QUIC packet received on the multicast flow socket.
+    ///
+    /// The packet is a 1-RTT short-header packet whose Destination Connection
+    /// ID is the Flow ID. It is decrypted with the flow key context in the flow
+    /// packet-number space, and its `DATAGRAM` frames are delivered to the
+    /// application exactly like unicast datagrams (retrieved with
+    /// [`Connection::dgram_recv`]). All other frame types are ignored.
+    ///
+    /// Unlike [`Connection::recv`], flow packets are never acknowledged and do
+    /// not reset the unicast connection's idle timer.
+    pub fn mc_recv(&mut self, buf: &mut [u8], _info: RecvInfo) -> Result<usize> {
+        // Phase 1: decrypt the packet and collect its datagrams while borrowing
+        // the (immutable) flow key context.
+        let (datagrams, pn, read) = {
+            let mc = self
+                .multicast
+                .as_ref()
+                .ok_or(Error::Multicast(McError::McFlow))?;
+            let open = mc
+                .flow_open
+                .as_ref()
+                .ok_or(Error::Multicast(McError::McFlow))?;
+            let flow_id = &mc.mc_flow_info.flow_id;
+
+            let mut b = octets::OctetsMut::with_slice(buf);
+
+            let mut hdr = packet::Header::from_bytes(&mut b, flow_id.len())
+                .map_err(|_| Error::Multicast(McError::McFlow))?;
+
+            // Only 1-RTT short-header packets addressed to the Flow ID belong to
+            // the flow.
+            if hdr.ty != packet::Type::Short || &hdr.dcid[..] != &flow_id[..] {
+                return Err(Error::Multicast(McError::McFlow));
+            }
+
+            let payload_len = b.cap();
+
+            packet::decrypt_hdr(&mut b, &mut hdr, open)
+                .map_err(|_| Error::Multicast(McError::McFlow))?;
+
+            // Reconstruct the full packet number in the flow space.
+            let largest = mc.flow_largest_pn.unwrap_or_else(|| {
+                mc.mc_flow_info.first_pn.saturating_sub(1)
+            });
+            let pn =
+                packet::decode_pkt_num(largest, hdr.pkt_num, hdr.pkt_num_len);
+
+            let mut payload = packet::decrypt_pkt(
+                &mut b,
+                pn,
+                hdr.pkt_num_len,
+                payload_len,
+                open,
+            )
+            .map_err(|_| Error::Multicast(McError::McFlow))?;
+
+            // A client MUST ignore any non-DATAGRAM frame on the flow.
+            let mut datagrams = Vec::new();
+            while payload.cap() > 0 {
+                let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)
+                    .map_err(|_| Error::Multicast(McError::McFlow))?;
+
+                if let frame::Frame::Datagram { data } = frame {
+                    datagrams.push(data);
+                }
+            }
+
+            (datagrams, pn, b.off())
+        };
+
+        // Phase 2: update flow state and deliver datagrams (mutable borrows of
+        // disjoint fields).
+        if let Some(mc) = self.multicast.as_mut() {
+            mc.flow_largest_pn = Some(match mc.flow_largest_pn {
+                Some(largest) => largest.max(pn),
+                None => pn,
+            });
+        }
+
+        for data in datagrams {
+            if self.dgram_recv_queue.is_full() {
+                self.dgram_recv_queue.pop();
+            }
+
+            self.dgram_recv_queue.push(data.into())?;
+            self.dgram_recv_count = self.dgram_recv_count.saturating_add(1);
+        }
+
+        Ok(read)
     }
 
     /// Returns the flow traffic secret of a multicast sender connection, to be
