@@ -189,6 +189,9 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// Whether the endpoint supports the minimal multicast extension and can
+    /// receive `MC_FLOW` frames.
+    pub multicast_support: bool,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
@@ -214,6 +217,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            multicast_support: false,
             unknown_params: Default::default(),
         }
     }
@@ -372,6 +376,11 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                // multicast_support (hackathon codepoint): zero-length.
+                0xff4d40 => {
+                    tp.multicast_support = true;
                 },
 
                 // Track unknown transport parameters specially.
@@ -557,6 +566,11 @@ impl TransportParams {
                 octets::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+
+        // multicast_support (hackathon codepoint): zero-length.
+        if tp.multicast_support {
+            TransportParams::encode_param(&mut b, 0xff4d40, 0)?;
         }
 
         let out_len = b.off();

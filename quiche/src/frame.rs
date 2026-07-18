@@ -25,6 +25,7 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::convert::TryInto;
+use std::net;
 
 use crate::Error;
 use crate::Result;
@@ -184,6 +185,16 @@ pub enum Frame {
     DatagramHeader {
         length: usize,
     },
+
+    McFlow {
+        flow_id: Vec<u8>,
+        source_ip: net::IpAddr,
+        group_ip: net::IpAddr,
+        udp_port: u16,
+        cipher_suite: u16,
+        first_pn: u64,
+        secret: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -330,6 +341,46 @@ impl Frame {
             0x1e => Frame::HandshakeDone,
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
+
+            0xff4d43 => {
+                let flow_id_len = b.get_u8()?;
+
+                if !(1..=packet::MAX_CID_LEN).contains(&flow_id_len) {
+                    return Err(Error::InvalidFrame);
+                }
+
+                let flow_id = b.get_bytes(flow_id_len as usize)?.to_vec();
+                let ip_version = b.get_u8()?;
+
+                // Assumes that both addresses are of the same family.
+                let (source_ip, group_ip) = match ip_version {
+                    4 => {
+                        let source_ipv4: net::Ipv4Addr = b.get_u32()?.into();
+                        let group_ipv4: net::Ipv4Addr = b.get_u32()?.into();
+                        (source_ipv4.into(), group_ipv4.into())
+                    },
+                    6 => {
+                        todo!("Add support for multicast QUIC IPv6");
+                    },
+                    _ => return Err(Error::InvalidFrame),
+                };
+
+                let udp_port = b.get_u16()?;
+                let cipher_suite = b.get_u16()?;
+                let first_pn = b.get_varint()?;
+                let secret_len = b.get_u8()?;
+                let secret = b.get_bytes(secret_len as usize)?.to_vec();
+
+                Frame::McFlow {
+                    flow_id,
+                    source_ip,
+                    group_ip,
+                    udp_port,
+                    cipher_suite,
+                    first_pn,
+                    secret,
+                }
+            },
 
             _ => return Err(Error::InvalidFrame),
         };
@@ -593,6 +644,39 @@ impl Frame {
             },
 
             Frame::DatagramHeader { .. } => (),
+
+            Frame::McFlow {
+                flow_id,
+                source_ip,
+                group_ip,
+                udp_port,
+                cipher_suite,
+                first_pn,
+                secret,
+            } => {
+                b.put_varint(0xff4d43)?;
+
+                b.put_u8(flow_id.len() as u8)?;
+                b.put_bytes(flow_id.as_ref())?;
+
+                // Assumes that both addresses are of the same family.
+                match (source_ip, group_ip) {
+                    (net::IpAddr::V4(src), net::IpAddr::V4(grp)) => {
+                        b.put_u8(4)?;
+                        b.put_u32(src.to_bits())?;
+                        b.put_u32(grp.to_bits())?;
+                    },
+                    _ => todo!(
+                        "Handle non-IPv4 addresses for minimal multicast QUIC"
+                    ),
+                }
+
+                b.put_u16(*udp_port)?;
+                b.put_u16(*cipher_suite)?;
+                b.put_varint(*first_pn)?;
+                b.put_u8(secret.len() as u8)?;
+                b.put_bytes(secret)?;
+            },
         }
 
         Ok(before - b.cap())
@@ -807,6 +891,26 @@ impl Frame {
                 1 + // frame type
                 2 + // length, always encode as 2-byte varint
                 *length // data
+            },
+
+            Frame::McFlow {
+                flow_id,
+                source_ip,
+                group_ip: _,
+                udp_port: _,
+                cipher_suite: _,
+                first_pn,
+                secret,
+            } => {
+                octets::varint_len(0xff4d43) + // frame type
+                1 + // flow_id length
+                flow_id.len() +
+                if source_ip.is_ipv4() { 4 + 4 } else { 16 + 16 } +
+                2 + // udp port
+                2 + // cipher suite
+                octets::varint_len(*first_pn) +
+                1 + // secret length
+                secret.len()
             },
         }
     }
@@ -1083,6 +1187,11 @@ impl Frame {
                     data: None,
                 })),
             },
+
+            Frame::McFlow { .. } => QuicFrame::Unknown {
+                frame_type_bytes: Some(0xff4d43),
+                raw: None,
+            },
         }
     }
 }
@@ -1249,6 +1358,18 @@ impl std::fmt::Debug for Frame {
 
             Frame::DatagramHeader { length } => {
                 write!(f, "DATAGRAM len={length}")?;
+            },
+
+            Frame::McFlow {
+                flow_id,
+                source_ip,
+                group_ip,
+                udp_port,
+                cipher_suite,
+                first_pn,
+                secret,
+            } => {
+                write!(f, "MC_FLOW flow_id={flow_id:?}, source_ip={source_ip:?}, group_ip={group_ip:?}, udp_port={udp_port:?}, cipher_suite={cipher_suite:?}, first_pn={first_pn:?}, secret={secret:?}")?;
             },
         }
 

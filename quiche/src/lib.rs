@@ -422,6 +422,7 @@ use smallvec::SmallVec;
 
 use crate::buffers::DefaultBufFactory;
 
+use crate::multicast::MulticastData;
 use crate::recovery::OnAckReceivedOutcome;
 use crate::recovery::OnLossDetectionTimeoutOutcome;
 use crate::recovery::RecoveryOps;
@@ -1189,6 +1190,16 @@ impl Config {
         self.dgram_send_max_queue_len = send_queue_len;
     }
 
+    /// Advertises support for the minimal multicast extension.
+    ///
+    /// When enabled, the endpoint includes the `multicast_support` transport
+    /// parameter in its handshake, signalling that it can receive `MC_FLOW`
+    /// frames. Only the client -> server direction is meaningful: a server only
+    /// sends `MC_FLOW` to clients that advertised this parameter.
+    pub fn set_multicast_support(&mut self, enabled: bool) {
+        self.local_transport_params.multicast_support = enabled;
+    }
+
     /// Configures the max number of queued received PATH_CHALLENGE frames.
     ///
     /// When an endpoint receives a PATH_CHALLENGE frame and the queue is full,
@@ -1589,6 +1600,9 @@ where
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
+
+    /// Minimal multicast extension.
+    multicast: Option<MulticastData>,
 }
 
 /// Creates a new server-side connection.
@@ -2214,6 +2228,8 @@ impl<F: BufFactory> Connection<F> {
             streams_blocked_uni_state: Default::default(),
 
             max_amplification_factor: config.max_amplification_factor,
+
+            multicast: None,
         };
         if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
@@ -3674,6 +3690,14 @@ impl<F: BufFactory> Connection<F> {
                         self.handshake_done_acked = true;
                     },
 
+                    frame::Frame::McFlow { .. } => {
+                        // The client acknowledged the multicast flow
+                        // advertisement; stop retransmitting it.
+                        if let Some(mc) = self.multicast.as_mut() {
+                            mc.mark_flow_acked();
+                        }
+                    },
+
                     frame::Frame::ResetStream { stream_id, .. } => {
                         let stream = match self.streams.get_mut(stream_id) {
                             Some(v) => v,
@@ -4361,6 +4385,14 @@ impl<F: BufFactory> Connection<F> {
                         // stats.
                         p.dgram_lost_count = p.dgram_lost_count.saturating_add(1);
                     },
+
+                    frame::Frame::McFlow { .. } => {
+                        // Reschedule the MC_FLOW frame for retransmission,
+                        // unless it has since been acknowledged.
+                        if let Some(mc) = self.multicast.as_mut() {
+                            mc.mark_flow_lost();
+                        }
+                    },
                     // IMPORTANT: Do not add an exhaustive catch
                     // all. We want to add explicit handling for frame
                     // types that can be safely ignored when lost.
@@ -4717,6 +4749,24 @@ impl<F: BufFactory> Connection<F> {
 
                     ack_eliciting = true;
                     in_flight = true;
+                }
+            }
+
+            // Create MC_FLOW frame to advertise a multicast flow to the client.
+            if self.is_server {
+                if let Some(frame) = self
+                    .multicast
+                    .as_ref()
+                    .and_then(|mc| mc.pending_flow_frame())
+                {
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        if let Some(mc) = self.multicast.as_mut() {
+                            mc.mark_flow_sent();
+                        }
+
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
                 }
             }
 
@@ -8192,6 +8242,7 @@ impl<F: BufFactory> Connection<F> {
         let send_path = self.paths.get(send_pid)?;
         if (self.is_established() || self.is_in_early_data()) &&
             (self.should_send_handshake_done() ||
+                self.mc_should_send_flow() ||
                 self.flow_control.should_update_max_data() ||
                 self.should_send_max_data ||
                 self.blocked_limit.is_some() ||
@@ -8808,6 +8859,31 @@ impl<F: BufFactory> Connection<F> {
 
                 let path = self.paths.get_mut(recv_path_id)?;
                 path.dgram_recv_count = path.dgram_recv_count.saturating_add(1);
+            },
+
+            frame::Frame::McFlow {
+                flow_id,
+                source_ip,
+                group_ip,
+                udp_port,
+                cipher_suite,
+                first_pn,
+                secret,
+            } => {
+                // Only the client should receive this frame.
+                if self.is_server {
+                    return Err(Error::InvalidFrame);
+                }
+
+                self.mc_new_from_info(
+                    flow_id,
+                    source_ip,
+                    group_ip,
+                    udp_port,
+                    cipher_suite,
+                    first_pn,
+                    secret,
+                )?;
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
@@ -9461,7 +9537,7 @@ impl std::fmt::Debug for Stats {
 }
 
 #[doc(hidden)]
-#[cfg(any(test, feature = "internal"))]
+// #[cfg(any(test, feature = "internal"))]
 pub mod test_utils;
 
 #[cfg(test)]
@@ -9508,6 +9584,7 @@ mod flowcontrol;
 mod frame;
 pub mod h3;
 mod minmax;
+pub mod multicast;
 mod packet;
 mod path;
 mod pmtud;
