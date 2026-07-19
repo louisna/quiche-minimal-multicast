@@ -127,4 +127,9 @@ impl Connection {
     pub fn mc_get_flow_info(&self) -> Option<&McFlowInfo> {
         self.multicast.as_ref().map(|mc| &mc.mc_flow_info)
     }
+
+    /// Returns the next packet number to be sent on the multicast flow.
+    pub fn mc_get_flow_pn(&self) -> u64 {
+        self.next_pkt_num
+    }
 }

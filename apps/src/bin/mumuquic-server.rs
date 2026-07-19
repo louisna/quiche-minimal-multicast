@@ -407,7 +407,7 @@ fn main() {
                     mc_flow_info.group_ip,
                     mc_flow_info.udp_port,
                     mc_flow_info.cipher_suite,
-                    mc_flow_info.first_pn,
+                    mc_flow.mc_get_flow_pn(),
                     mc_flow_info.secret.clone(),
                 )
                 .unwrap();

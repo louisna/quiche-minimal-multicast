@@ -108,7 +108,6 @@ fn main() {
     config
         .set_application_protos(&[b"mumu-quic", b"mcquic", b"mc-quic"])
         .unwrap();
-    config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
