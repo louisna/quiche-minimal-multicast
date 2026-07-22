@@ -32,6 +32,10 @@ use std::time;
 
 use std::collections::HashMap;
 
+use flute::core::lct::Cenc;
+use flute::core::UDPEndpoint;
+use flute::sender::ObjectDesc;
+use flute::sender::Sender;
 use quiche::multicast::mc_flow::mc_new_flow;
 use ring::rand::*;
 use socket2;
@@ -78,6 +82,8 @@ fn main() {
     let mut args = std::env::args();
 
     let cmd = &args.next().unwrap();
+
+    let send_stream = true;
 
     if args.len() != 0 {
         println!("Usage: {cmd}");
@@ -166,7 +172,8 @@ fn main() {
 
     // Retrieve the multicast flow announcement.
     let mc_flow_info = mc_flow.mc_get_flow_info().unwrap().clone().to_owned();
-    // let mc_sockaddr = format!("[{}]:{}", MC_GROUP_IP, MC_PORT).parse().unwrap();
+    // let mc_sockaddr = format!("[{}]:{}", MC_GROUP_IP,
+    // MC_PORT).parse().unwrap();
     let mc_sockaddr = format!("{}:{}", MC_GROUP_IP, MC_PORT).parse().unwrap();
 
     // Open a new UDP socket to read the RTP frames.
@@ -181,6 +188,34 @@ fn main() {
     // SDP content, loaded lazily the first time it is needed (ffmpeg may create
     // the file after the server has started).
     let mut sdp_content: Option<Vec<u8>> = None;
+
+    // Open a Flute sender if required.
+    let mut flute_sender_opt = if send_stream {
+        // Create FLUTE Sender
+        let tsi = 1;
+        let oti = Default::default();
+        let config = Default::default();
+        let endpoint = UDPEndpoint::new(None, "224.0.0.1".to_string(), 3400);
+        let mut sender = Sender::new(endpoint, tsi, &oti, &config);
+
+        // Add object(s) (files) to the FLUTE sender (priority queue 0)
+        let obj = ObjectDesc::create_from_buffer(
+            b"hello world".to_vec(),
+            "text/plain",
+            &url::Url::parse("file:///hello.txt").unwrap(),
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        sender.add_object(0, obj).unwrap();
+
+        // Always call publish after adding objects when FDT publish mode
+        // is FullFDT
+        sender.publish(time::SystemTime::now()).unwrap();
+        Some(sender)
+    } else {
+        None
+    };
 
     // Advertise the service over mDNS (Bonjour) so receivers can discover it.
     // `dns-sd -R` blocks for as long as the registration is active, which is
@@ -353,7 +388,10 @@ fn main() {
                 // instead of changing it again.
                 let scid = hdr.dcid.clone();
 
-                info!("New connection: dcid={:?} scid={:?} and IP={:?}", hdr.dcid, scid, from);
+                info!(
+                    "New connection: dcid={:?} scid={:?} and IP={:?}",
+                    hdr.dcid, scid, from
+                );
 
                 let conn = quiche::accept(
                     &scid,
@@ -408,6 +446,7 @@ fn main() {
                     mc_flow_info.udp_port,
                     mc_flow_info.cipher_suite,
                     mc_flow.mc_get_flow_pn(),
+                    // mc_flow_info.first_pn,
                     mc_flow_info.secret.clone(),
                 )
                 .unwrap();
@@ -417,20 +456,25 @@ fn main() {
                 // over a server-initiated unidirectional stream, so it can play
                 // the multicast video.
                 if client.conn.is_established() && !client.sdp_sent {
-                    if sdp_content.is_none() {
-                        match std::fs::read(SDP_PATH) {
-                            Ok(data) => sdp_content = Some(data),
+                    if send_stream {
+                        if sdp_content.is_none() {
+                            match std::fs::read(SDP_PATH) {
+                                Ok(data) => sdp_content = Some(data),
 
-                            Err(e) => warn!(
-                                "SDP file {SDP_PATH} not available yet: {e}"
-                            ),
+                                Err(e) => warn!(
+                                    "SDP file {SDP_PATH} not available yet: {e}"
+                                ),
+                            }
                         }
-                    }
 
-                    if let Some(sdp) = sdp_content.as_ref() {
-                        match client.conn.stream_send(SDP_STREAM_ID, sdp, true) {
-                            Ok(written) => {
-                                info!(
+                        if let Some(sdp) = sdp_content.as_ref() {
+                            match client.conn.stream_send(
+                                SDP_STREAM_ID,
+                                sdp,
+                                true,
+                            ) {
+                                Ok(written) => {
+                                    info!(
                                     "{} pushed SDP ({}/{} bytes) on stream {}",
                                     client.conn.trace_id(),
                                     written,
@@ -438,27 +482,28 @@ fn main() {
                                     SDP_STREAM_ID
                                 );
 
-                                // Finish the transfer later if flow control
-                                // capped this send.
-                                if written < sdp.len() {
-                                    client.partial_responses.insert(
-                                        SDP_STREAM_ID,
-                                        PartialResponse {
-                                            body: sdp.clone(),
-                                            written,
-                                        },
-                                    );
-                                }
+                                    // Finish the transfer later if flow control
+                                    // capped this send.
+                                    if written < sdp.len() {
+                                        client.partial_responses.insert(
+                                            SDP_STREAM_ID,
+                                            PartialResponse {
+                                                body: sdp.clone(),
+                                                written,
+                                            },
+                                        );
+                                    }
 
-                                client.sdp_sent = true;
-                            },
+                                    client.sdp_sent = true;
+                                },
 
-                            Err(quiche::Error::Done) => (),
+                                Err(quiche::Error::Done) => (),
 
-                            Err(e) => error!(
-                                "{} SDP send failed: {e:?}",
-                                client.conn.trace_id()
-                            ),
+                                Err(e) => error!(
+                                    "{} SDP send failed: {e:?}",
+                                    client.conn.trace_id()
+                                ),
+                            }
                         }
                     }
                 }
@@ -497,23 +542,33 @@ fn main() {
 
         // Read RTP frames from the RTP socket.
         // Feed them on the multicast flow.
-        'rtp_read: loop {
-            let (len, _from) = match rtp_sock.recv_from(&mut buf) {
-                Ok(v) => v,
+        'app_read: loop {
+            if send_stream {
+                let (len, _from) = match rtp_sock.recv_from(&mut buf) {
+                    Ok(v) => v,
 
-                Err(e) => {
-                    // There are no more UDP packets to read, so end the read
-                    // loop.
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        debug!("recv() would block");
-                        break 'rtp_read;
-                    }
+                    Err(e) => {
+                        // There are no more UDP packets to read, so end the read
+                        // loop.
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            debug!("recv() would block");
+                            break 'app_read;
+                        }
 
-                    panic!("recv() failed: {e:?}");
-                },
-            };
+                        panic!("recv() failed: {e:?}");
+                    },
+                };
 
-            mc_flow.dgram_send(&buf[..len]).unwrap();
+                mc_flow.dgram_send(&buf[..len]).unwrap();
+            } else if let Some(ref mut flute_reader) = flute_sender_opt {
+                // Send FLUTE packets over UDP/IP
+                if mc_flow.is_dgram_send_queue_full() {
+                    break 'app_read;
+                }
+                if let Some(pkt) = flute_reader.read(time::SystemTime::now()) {
+                    mc_flow.dgram_send(&pkt).unwrap();
+                }
+            }
 
             let write = match mc_flow.send(&mut out) {
                 Ok((write, _send_info)) => write,

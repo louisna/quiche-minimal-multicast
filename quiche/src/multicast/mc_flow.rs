@@ -14,6 +14,7 @@ use super::MulticastData;
 use crate::crypto::Algorithm;
 use crate::multicast::error::McError;
 use crate::packet;
+use crate::ranges;
 use crate::test_utils::Pipe;
 use crate::Config;
 use crate::Connection;
@@ -117,6 +118,9 @@ pub fn mc_new_flow(
         mc_flow_acked: true,
         flow_largest_pn: None, // Not meaningful.
         flow_open: None,       // Not meaningful.
+        flow_recv_pns: ranges::RangeSet::default(), // Not meaningful.
+        flow_ack_pending: false,                    // Not meaningful.
+        flow_acked_pns: None,                       // Not meaningful.
     });
 
     Ok(sender)

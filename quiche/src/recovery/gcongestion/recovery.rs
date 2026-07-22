@@ -708,6 +708,10 @@ impl RecoveryOps for GRecovery {
         self.epochs[epoch].next_lost_frame()
     }
 
+    fn oldest_sent_pkt_num(&self, epoch: packet::Epoch) -> Option<u64> {
+        self.epochs[epoch].sent_packets.front().map(|p| p.pkt_num)
+    }
+
     fn get_largest_acked_on_epoch(&self, epoch: packet::Epoch) -> Option<u64> {
         self.epochs[epoch].largest_acked_packet
     }

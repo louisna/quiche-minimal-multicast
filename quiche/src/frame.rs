@@ -195,6 +195,12 @@ pub enum Frame {
         first_pn: u64,
         secret: Vec<u8>,
     },
+
+    McAck {
+        flow_id: Vec<u8>,
+        ack_delay: u64,
+        ranges: ranges::RangeSet,
+    },
 }
 
 impl Frame {
@@ -394,6 +400,8 @@ impl Frame {
                     secret,
                 }
             },
+
+            0xff4d44 => parse_mc_ack_frame(b)?,
 
             _ => return Err(Error::InvalidFrame),
         };
@@ -693,6 +701,41 @@ impl Frame {
                 b.put_u8(secret.len() as u8)?;
                 b.put_bytes(secret)?;
             },
+
+            Frame::McAck {
+                flow_id,
+                ack_delay,
+                ranges,
+            } => {
+                b.put_varint(0xff4d44)?;
+
+                b.put_u8(flow_id.len() as u8)?;
+                b.put_bytes(flow_id.as_ref())?;
+
+                // The acknowledged packet numbers reuse the ACK frame's range
+                // encoding, scoped to the flow packet-number space.
+                let mut it = ranges.iter().rev();
+
+                let first = it.next().unwrap();
+                let ack_block = (first.end - 1) - first.start;
+
+                b.put_varint(first.end - 1)?;
+                b.put_varint(*ack_delay)?;
+                b.put_varint(it.len() as u64)?;
+                b.put_varint(ack_block)?;
+
+                let mut smallest_ack = first.start;
+
+                for block in it {
+                    let gap = smallest_ack - block.end - 1;
+                    let ack_block = (block.end - 1) - block.start;
+
+                    b.put_varint(gap)?;
+                    b.put_varint(ack_block)?;
+
+                    smallest_ack = block.start;
+                }
+            },
         }
 
         Ok(before - b.cap())
@@ -928,6 +971,39 @@ impl Frame {
                 octets::varint_len(*first_pn) +
                 1 + // secret length
                 secret.len()
+            },
+
+            Frame::McAck {
+                flow_id,
+                ack_delay,
+                ranges,
+            } => {
+                let mut it = ranges.iter().rev();
+
+                let first = it.next().unwrap();
+                let ack_block = (first.end - 1) - first.start;
+
+                let mut len = octets::varint_len(0xff4d44) + // frame type
+                    1 + // flow_id length
+                    flow_id.len() +
+                    octets::varint_len(first.end - 1) + // largest_ack
+                    octets::varint_len(*ack_delay) + // ack_delay
+                    octets::varint_len(it.len() as u64) + // block_count
+                    octets::varint_len(ack_block); // first_block
+
+                let mut smallest_ack = first.start;
+
+                for block in it {
+                    let gap = smallest_ack - block.end - 1;
+                    let ack_block = (block.end - 1) - block.start;
+
+                    len += octets::varint_len(gap) + // gap
+                           octets::varint_len(ack_block); // ack_block
+
+                    smallest_ack = block.start;
+                }
+
+                len
             },
         }
     }
@@ -1209,6 +1285,11 @@ impl Frame {
                 frame_type_bytes: Some(0xff4d43),
                 raw: None,
             },
+
+            Frame::McAck { .. } => QuicFrame::Unknown {
+                frame_type_bytes: Some(0xff4d44),
+                raw: None,
+            },
         }
     }
 }
@@ -1388,6 +1469,14 @@ impl std::fmt::Debug for Frame {
             } => {
                 write!(f, "MC_FLOW flow_id={flow_id:?}, source_ip={source_ip:?}, group_ip={group_ip:?}, udp_port={udp_port:?}, cipher_suite={cipher_suite:?}, first_pn={first_pn:?}, secret={secret:?}")?;
             },
+
+            Frame::McAck {
+                flow_id,
+                ack_delay,
+                ranges,
+            } => {
+                write!(f, "MC_ACK flow_id={flow_id:?}, ack_delay={ack_delay:?}, ranges={ranges:?}")?;
+            },
         }
 
         Ok(())
@@ -1447,6 +1536,33 @@ fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
         ack_delay,
         ranges,
         ecn_counts,
+    })
+}
+
+// Parses an MC_ACK frame: a Flow ID followed by the same wire encoding as an
+// ACK frame, scoped to that flow's packet-number space. The range decoding is
+// delegated to `parse_ack_frame` (type `0x02`, i.e. without ECN counts).
+fn parse_mc_ack_frame(b: &mut octets::Octets) -> Result<Frame> {
+    let flow_id_len = b.get_u8()?;
+
+    if !(1..=packet::MAX_CID_LEN).contains(&flow_id_len) {
+        return Err(Error::InvalidFrame);
+    }
+
+    let flow_id = b.get_bytes(flow_id_len as usize)?.to_vec();
+
+    let (ack_delay, ranges) = match parse_ack_frame(0x02, b)? {
+        Frame::ACK {
+            ack_delay, ranges, ..
+        } => (ack_delay, ranges),
+
+        _ => unreachable!(),
+    };
+
+    Ok(Frame::McAck {
+        flow_id,
+        ack_delay,
+        ranges,
     })
 }
 
@@ -1640,6 +1756,38 @@ mod tests {
 
         let mut b = octets::Octets::with_slice(&d);
         assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_ok());
+    }
+
+    #[test]
+    fn mc_ack() {
+        let mut d = [42; 128];
+
+        let mut ranges = ranges::RangeSet::default();
+        ranges.insert(4..7);
+        ranges.insert(9..12);
+        ranges.insert(15..19);
+        ranges.insert(3000..5000);
+
+        let frame = Frame::McAck {
+            flow_id: vec![0x11; 8],
+            ack_delay: 874_656_534,
+            ranges,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        // `to_bytes` and `wire_len` must agree.
+        assert_eq!(frame.wire_len(), wire_len);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        // MC_ACK is only carried on 1-RTT (Short) packets.
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_err());
     }
 
     #[test]

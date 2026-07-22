@@ -3598,6 +3598,15 @@ impl<F: BufFactory> Connection<F> {
                         }
                     },
 
+                    frame::Frame::McAck {
+                        flow_id: _,
+                        ack_delay: _,
+                        ranges,
+                    } =>
+                        if let Some(mc) = self.multicast.as_mut() {
+                            mc.remove_ack_up_to(ranges.last());
+                        },
+
                     frame::Frame::CryptoHeader { offset, length } => {
                         self.crypto_ctx[epoch]
                             .crypto_stream
@@ -4393,6 +4402,14 @@ impl<F: BufFactory> Connection<F> {
                             mc.mark_flow_lost();
                         }
                     },
+
+                    frame::Frame::McAck { .. } => {
+                        // Reschedule an MC_ACK so the latest flow reception
+                        // state is reported again.
+                        if let Some(mc) = self.multicast.as_mut() {
+                            mc.mark_ack_lost();
+                        }
+                    },
                     // IMPORTANT: Do not add an exhaustive catch
                     // all. We want to add explicit handling for frame
                     // types that can be safely ignored when lost.
@@ -4762,6 +4779,25 @@ impl<F: BufFactory> Connection<F> {
                     if push_frame_to_pkt!(b, frames, frame, left) {
                         if let Some(mc) = self.multicast.as_mut() {
                             mc.mark_flow_sent();
+                        }
+
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
+                }
+            }
+
+            // Create MC_ACK frame to report multicast flow packets received by
+            // the client back to the server.
+            if !self.is_server {
+                if let Some(frame) = self
+                    .multicast
+                    .as_ref()
+                    .and_then(|mc| mc.pending_ack_frame())
+                {
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        if let Some(mc) = self.multicast.as_mut() {
+                            mc.mark_ack_sent();
                         }
 
                         ack_eliciting = true;
@@ -8243,6 +8279,7 @@ impl<F: BufFactory> Connection<F> {
         if (self.is_established() || self.is_in_early_data()) &&
             (self.should_send_handshake_done() ||
                 self.mc_should_send_flow() ||
+                self.mc_should_send_ack() ||
                 self.flow_control.should_update_max_data() ||
                 self.should_send_max_data ||
                 self.blocked_limit.is_some() ||
@@ -8884,6 +8921,24 @@ impl<F: BufFactory> Connection<F> {
                     first_pn,
                     secret,
                 )?;
+            },
+
+            frame::Frame::McAck {
+                flow_id, ranges, ..
+            } => {
+                // Only the server should receive this frame.
+                if !self.is_server {
+                    return Err(Error::InvalidFrame);
+                }
+
+                // Record the reported flow packet numbers for relay to the
+                // standalone sender connection, ignoring reports for an unknown
+                // flow.
+                if let Some(mc) = self.multicast.as_mut() {
+                    if mc.mc_flow_info.flow_id == flow_id {
+                        mc.store_flow_ack(ranges);
+                    }
+                }
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),

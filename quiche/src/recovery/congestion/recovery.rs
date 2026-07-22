@@ -592,6 +592,10 @@ impl RecoveryOps for LegacyRecovery {
         self.epochs[epoch].largest_acked_packet
     }
 
+    fn oldest_sent_pkt_num(&self, epoch: Epoch) -> Option<u64> {
+        self.epochs[epoch].sent_packets.front().map(|p| p.pkt_num)
+    }
+
     fn has_lost_frames(&self, epoch: Epoch) -> bool {
         self.epochs[epoch].has_lost_frames()
     }

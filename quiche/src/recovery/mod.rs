@@ -197,6 +197,14 @@ pub trait RecoveryOps {
     fn next_lost_frame(&mut self, epoch: packet::Epoch) -> Option<frame::Frame>;
 
     fn get_largest_acked_on_epoch(&self, epoch: packet::Epoch) -> Option<u64>;
+
+    /// The packet number of the oldest packet still tracked in `epoch`'s sent
+    /// queue (its front). Every packet below it has been resolved
+    /// (acknowledged, or declared lost and re-sent) and dropped from tracking,
+    /// so it bounds how much multicast receiver state can be pruned. `None` if
+    /// the queue is empty.
+    fn oldest_sent_pkt_num(&self, epoch: packet::Epoch) -> Option<u64>;
+
     fn has_lost_frames(&self, epoch: packet::Epoch) -> bool;
     fn loss_probes(&self, epoch: packet::Epoch) -> usize;
     #[cfg(test)]
@@ -374,7 +382,7 @@ pub enum CongestionControlAlgorithm {
     /// BBRv2 congestion control algorithm implementation from gcongestion
     /// branch. `bbr2_gcongestion` in a string form.
     Bbr2Gcongestion = 4,
-    // Disabled congestion control.
+    /// Disabled congestion control.
     Disabled = 5,
 }
 
