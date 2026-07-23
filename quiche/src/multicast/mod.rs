@@ -664,6 +664,10 @@ mod tests {
         config.set_initial_max_stream_data_uni(100_000);
         config.set_initial_max_streams_bidi(10);
         config.set_initial_max_streams_uni(10);
+        // Cap the packet size so a moderately sized stream deterministically
+        // spans several flow packets.
+        config.set_max_send_udp_payload_size(1200);
+        config.set_max_recv_udp_payload_size(1200);
         config.verify_peer(false);
         config
     }
@@ -755,5 +759,77 @@ mod tests {
         // The server can relay the reported reception to the sender.
         let acked = pipe.server.mc_take_flow_ack().expect("flow ack reported");
         assert_eq!(acked.last(), Some(first_pn));
+    }
+
+    #[test]
+    fn flow_ack_triggers_retransmission() {
+        let (mut sender, mut pipe) = sender_and_receiver(vec![0x51; 8]);
+        let first_pn = sender.mc_get_flow_info().unwrap().first_pn;
+
+        // Send a stream large enough to span several flow packets.
+        let data = vec![0xa5u8; 6000];
+        sender.stream_send(3, &data, true).unwrap();
+
+        // Collect every flow packet the sender produces (packet i has packet
+        // number first_pn + i).
+        let mut packets: Vec<Vec<u8>> = Vec::new();
+        let mut buf = [0u8; 1500];
+        loop {
+            match sender.send(&mut buf) {
+                Ok((len, _)) => packets.push(buf[..len].to_vec()),
+                Err(Error::Done) => break,
+                Err(e) => panic!("send failed: {e:?}"),
+            }
+        }
+        assert!(
+            packets.len() >= 4,
+            "need enough packets for loss detection, got {}",
+            packets.len()
+        );
+
+        // Deliver every packet except the first, leaving a gap at the start of
+        // the stream the receiver cannot yet read past.
+        for pkt in &packets[1..] {
+            let mut b = pkt.clone();
+            pipe.client.mc_recv(&mut b, flow_recv_info()).unwrap();
+        }
+        let mut out = vec![0u8; data.len()];
+        assert_eq!(pipe.client.stream_recv(3, &mut out), Err(Error::Done));
+
+        // Report to the sender that every packet but the first was received.
+        let mut acked = ranges::RangeSet::default();
+        acked.insert(first_pn + 1..first_pn + packets.len() as u64);
+        sender.mc_on_flow_ack(&acked).unwrap();
+
+        // The sender now retransmits the lost stream data; deliver it.
+        let mut retransmitted = false;
+        loop {
+            match sender.send(&mut buf) {
+                Ok((len, _)) => {
+                    let mut b = buf[..len].to_vec();
+                    pipe.client.mc_recv(&mut b, flow_recv_info()).unwrap();
+                    retransmitted = true;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("send failed: {e:?}"),
+            }
+        }
+        assert!(retransmitted, "sender did not retransmit after the ack");
+
+        // With the gap filled, the receiver can read the whole stream.
+        let mut got = Vec::new();
+        loop {
+            match pipe.client.stream_recv(3, &mut out) {
+                Ok((read, fin)) => {
+                    got.extend_from_slice(&out[..read]);
+                    if fin {
+                        break;
+                    }
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("stream_recv failed: {e:?}"),
+            }
+        }
+        assert_eq!(got, data);
     }
 }
