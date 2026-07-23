@@ -96,4 +96,3 @@ pub fn state_str(r: &Congestion, now: Instant) -> &'static str {
 fn debug_fmt(_r: &Congestion, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
     Ok(())
 }
-

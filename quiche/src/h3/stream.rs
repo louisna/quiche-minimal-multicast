@@ -38,6 +38,16 @@ pub const HTTP3_PUSH_STREAM_TYPE_ID: u64 = 0x1;
 pub const QPACK_ENCODER_STREAM_TYPE_ID: u64 = 0x2;
 pub const QPACK_DECODER_STREAM_TYPE_ID: u64 = 0x3;
 
+/// Extension: a unidirectional stream carrying a redirected HTTP/3 response.
+/// Instead of answering on the request's bidirectional stream, the server
+/// points the client at this stream, whose payload is a correlation ID varint
+/// followed by the usual HEADERS/DATA frames. The correlation ID ties it back
+/// to the originating request. This decouples the response from the request
+/// stream, which lets a single stream serve one client (e.g. server-driven
+/// redirection) or, when carried over a shared flow, many clients at once
+/// (multicast). The ID lives in the `0xff4d4X`/`0xff4d5X` extension space.
+pub const UNI_RESPONSE_STREAM_TYPE_ID: u64 = 0xff4d52;
+
 const MAX_STATE_BUF_SIZE: usize = (1 << 24) - 1;
 const MAX_STATE_BUF_ALLOC_SIZE: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +57,11 @@ pub enum Type {
     Push,
     QpackEncoder,
     QpackDecoder,
+    /// Extension: a redirected response stream, prefixed by a correlation ID
+    /// and then framed like a response (HEADERS followed by DATA). Carried on
+    /// a unidirectional stream so it can be delivered independently of the
+    /// request stream (e.g. over a shared multicast flow).
+    UniResponse,
     Unknown,
 }
 
@@ -59,6 +74,8 @@ impl Type {
             Type::Push => qlog::events::http3::StreamType::Push,
             Type::QpackEncoder => qlog::events::http3::StreamType::QpackEncode,
             Type::QpackDecoder => qlog::events::http3::StreamType::QpackDecode,
+            // No dedicated qlog stream type for the multicast response stream.
+            Type::UniResponse => qlog::events::http3::StreamType::Unknown,
             Type::Unknown => qlog::events::http3::StreamType::Unknown,
         }
     }
@@ -84,6 +101,9 @@ pub enum State {
     /// Reading the push ID.
     PushId,
 
+    /// Reading the correlation ID prefixing a multicast response stream.
+    CorrelationId,
+
     /// Reading a QPACK instruction.
     QpackInstruction,
 
@@ -104,6 +124,7 @@ impl Type {
             HTTP3_PUSH_STREAM_TYPE_ID => Ok(Type::Push),
             QPACK_ENCODER_STREAM_TYPE_ID => Ok(Type::QpackEncoder),
             QPACK_DECODER_STREAM_TYPE_ID => Ok(Type::QpackDecoder),
+            UNI_RESPONSE_STREAM_TYPE_ID => Ok(Type::UniResponse),
 
             _ => Ok(Type::Unknown),
         }
@@ -148,6 +169,11 @@ pub struct Stream {
 
     /// The type of the frame currently being parsed.
     frame_type: Option<u64>,
+
+    /// The correlation ID prefixing a redirected response stream
+    /// (`Type::UniResponse`), used to match it back to the request that was
+    /// redirected here. `None` for every other stream type.
+    correlation_id: Option<u64>,
 
     /// Whether the stream was created locally, or by the peer.
     is_local: bool,
@@ -229,6 +255,8 @@ impl Stream {
 
             frame_type: None,
 
+            correlation_id: None,
+
             is_local,
 
             remote_initialized: false,
@@ -271,6 +299,8 @@ impl Stream {
 
             Type::Push => State::PushId,
 
+            Type::UniResponse => State::CorrelationId,
+
             Type::QpackEncoder | Type::QpackDecoder => {
                 self.remote_initialized = true;
 
@@ -294,6 +324,34 @@ impl Stream {
         self.state_transition(State::FrameType, 1, true)?;
 
         Ok(())
+    }
+
+    /// Sets the correlation ID prefixing a redirected response stream and
+    /// transitions to reading the response frames. The correlation ID is
+    /// matched by the client against the one returned in the redirect on the
+    /// request stream, to route the response to its originating request.
+    pub fn set_correlation_id(&mut self, id: u64) -> Result<()> {
+        assert_eq!(self.state, State::CorrelationId);
+
+        self.correlation_id = Some(id);
+
+        self.state_transition(State::FrameType, 1, true)?;
+
+        Ok(())
+    }
+
+    /// Returns the correlation ID prefixing a redirected response stream, if
+    /// this is one and the ID has been read.
+    pub fn correlation_id(&self) -> Option<u64> {
+        self.correlation_id
+    }
+
+    /// Marks a locally-initiated stream as a redirected response stream
+    /// (`Type::UniResponse`). Used on the send side, where the type is chosen
+    /// locally and written to the wire rather than parsed off it, so
+    /// `set_ty()`'s receive-side state transitions don't apply.
+    pub fn set_local_uni_response(&mut self) {
+        self.ty = Some(Type::UniResponse);
     }
 
     /// Sets the frame type and transitions to the next state.
@@ -339,7 +397,9 @@ impl Stream {
                 self.validate_request_frame_type(ty)?;
             },
 
-            Some(Type::Push) => {
+            // A multicast response stream carries a response, so it accepts
+            // the same frames as a push stream (HEADERS then DATA).
+            Some(Type::Push) | Some(Type::UniResponse) => {
                 match ty {
                     // Frames that can never be received on request streams.
                     frame::CANCEL_PUSH_FRAME_TYPE_ID =>
@@ -446,8 +506,12 @@ impl Stream {
     pub fn set_frame_payload_len(&mut self, len: u64) -> Result<()> {
         assert_eq!(self.state, State::FramePayloadLen);
 
-        // Only expect frames on Control, Request and Push streams.
-        if !matches!(self.ty, Some(Type::Control | Type::Request | Type::Push)) {
+        // Only expect frames on Control, Request, Push and multicast response
+        // streams.
+        if !matches!(
+            self.ty,
+            Some(Type::Control | Type::Request | Type::Push | Type::UniResponse)
+        ) {
             return Err(Error::InternalError);
         }
 

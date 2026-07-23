@@ -353,11 +353,11 @@ mod tests {
 
 mod cubic;
 mod delivery_rate;
+mod disabled;
 mod hystart;
 mod prr;
 pub(crate) mod recovery;
 mod reno;
-mod disabled;
 
 #[cfg(test)]
 mod test_sender;

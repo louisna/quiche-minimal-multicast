@@ -527,9 +527,9 @@ pub struct McFlowInfo {
     pub secret: Vec<u8>,
 }
 
+pub mod aggregator;
 pub mod error;
 pub mod mc_flow;
-pub mod aggregator;
 
 #[cfg(test)]
 mod tests {

@@ -125,9 +125,14 @@ fn main() {
     SystemRandom::new().fill(&mut scid[..]).unwrap();
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut conn =
-        quiche::connect(Some("localhost"), &scid, local_addr, peer_addr, &mut config)
-            .unwrap();
+    let mut conn = quiche::connect(
+        Some("localhost"),
+        &scid,
+        local_addr,
+        peer_addr,
+        &mut config,
+    )
+    .unwrap();
 
     info!("connecting to {peer_addr}");
 
@@ -259,8 +264,7 @@ fn main() {
 
 /// Drains a connection's pending packets to the unicast socket.
 fn flush_send(
-    conn: &mut quiche::Connection, socket: &mio::net::UdpSocket,
-    out: &mut [u8],
+    conn: &mut quiche::Connection, socket: &mio::net::UdpSocket, out: &mut [u8],
 ) {
     loop {
         let (write, send_info) = match conn.send(out) {
@@ -296,8 +300,7 @@ fn join_multicast(
                     .unwrap();
             sock.set_reuse_address(true).unwrap();
 
-            let bind: net::SocketAddr =
-                (net::Ipv4Addr::UNSPECIFIED, port).into();
+            let bind: net::SocketAddr = (net::Ipv4Addr::UNSPECIFIED, port).into();
             sock.bind(&bind.into()).unwrap();
 
             sock.join_multicast_v4(&group, &net::Ipv4Addr::UNSPECIFIED)
@@ -311,8 +314,7 @@ fn join_multicast(
                     .unwrap();
             sock.set_reuse_address(true).unwrap();
 
-            let bind: net::SocketAddr =
-                (net::Ipv6Addr::UNSPECIFIED, port).into();
+            let bind: net::SocketAddr = (net::Ipv6Addr::UNSPECIFIED, port).into();
             sock.bind(&bind.into()).unwrap();
 
             // Interface index 0 selects the default multicast interface.

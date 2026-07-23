@@ -383,7 +383,7 @@ pub enum CongestionControlAlgorithm {
     /// branch. `bbr2_gcongestion` in a string form.
     Bbr2Gcongestion = 4,
     /// Disabled congestion control.
-    Disabled = 5,
+    Disabled        = 5,
 }
 
 impl FromStr for CongestionControlAlgorithm {

@@ -119,8 +119,8 @@ pub fn mc_new_flow(
         flow_largest_pn: None, // Not meaningful.
         flow_open: None,       // Not meaningful.
         flow_recv_pns: ranges::RangeSet::default(), // Not meaningful.
-        flow_ack_pending: false,                    // Not meaningful.
-        flow_acked_pns: None,                       // Not meaningful.
+        flow_ack_pending: false, // Not meaningful.
+        flow_acked_pns: None,  // Not meaningful.
     });
 
     Ok(sender)

@@ -137,9 +137,7 @@ impl McAckAggregator {
 /// Relies on [`ranges::RangeSet::iter`] yielding ascending, non-overlapping,
 /// half-open `[start, end)` ranges: a two-pointer merge that advances whichever
 /// range ends first.
-fn intersect(
-    a: &ranges::RangeSet, b: &ranges::RangeSet,
-) -> ranges::RangeSet {
+fn intersect(a: &ranges::RangeSet, b: &ranges::RangeSet) -> ranges::RangeSet {
     let mut out = ranges::RangeSet::default();
 
     let mut ia = a.iter();
